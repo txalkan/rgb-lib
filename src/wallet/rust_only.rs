@@ -384,6 +384,45 @@ impl Wallet {
         Ok(())
     }
 
+    /// Inspect arbitrary outpoints for assignments of a given contract.
+    ///
+    /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
+    pub fn contract_assignments_for_outpoints(
+        &self,
+        contract_id: ContractId,
+        outpoints: Vec<Outpoint>,
+    ) -> Result<HashMap<Outpoint, Vec<Assignment>>, Error> {
+        let btc_outpoints: Vec<OutPoint> = outpoints
+            .iter()
+            .map(|o| {
+                let txid =
+                    crate::bitcoin::Txid::from_str(&o.txid).map_err(|_| Error::InvalidTxid)?;
+                Ok(OutPoint {
+                    txid,
+                    vout: o.vout,
+                })
+            })
+            .collect::<Result<_, Error>>()?;
+
+        let runtime = self.rgb_runtime()?;
+        let state = runtime.contract_assignments_for(contract_id, btc_outpoints)?;
+
+        let mut res: HashMap<Outpoint, Vec<Assignment>> = HashMap::new();
+        for (seal, opout_state_map) in state {
+            let outpoint = Outpoint {
+                txid: seal.txid.to_string(),
+                vout: seal.vout.into_u32(),
+            };
+            let mut assignments = Vec::with_capacity(opout_state_map.len());
+            for (opout, state) in opout_state_map {
+                assignments.push(Assignment::from_opout_and_state(opout, &state));
+            }
+            res.insert(outpoint, assignments);
+        }
+
+        Ok(res)
+    }
+
     /// Get the height for a Bitcoin TX.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use

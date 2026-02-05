@@ -168,6 +168,42 @@ fn success() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
+fn contract_assignments_for_outpoints_success() {
+    initialize();
+
+    let (mut wallet, online) = get_funded_wallet!();
+    let asset = test_issue_asset_nia(&mut wallet, &online, Some(&[AMOUNT]));
+
+    let unspents: Vec<Unspent> = test_list_unspents(&mut wallet, Some(&online), true)
+        .into_iter()
+        .filter(|u| {
+            u.rgb_allocations
+                .iter()
+                .any(|a| a.asset_id == Some(asset.asset_id.clone()))
+        })
+        .collect();
+    assert!(!unspents.is_empty());
+
+    let outpoint = unspents.first().unwrap().utxo.outpoint.clone();
+    let contract_id = ContractId::from_str(&asset.asset_id).unwrap();
+
+    let assignments_map = wallet
+        .contract_assignments_for_outpoints(contract_id, vec![outpoint.clone()])
+        .unwrap();
+    let assignments = assignments_map
+        .get(&outpoint)
+        .expect("assignments for outpoint");
+    assert!(!assignments.is_empty());
+    assert!(
+        assignments
+            .iter()
+            .any(|a| matches!(a, Assignment::Fungible(_)))
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
 fn list_unspents_vanilla_success() {
     initialize();
 
