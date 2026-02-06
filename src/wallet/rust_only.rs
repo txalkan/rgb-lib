@@ -76,14 +76,11 @@ pub fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
 }
 
 impl Wallet {
-    /// Color a PSBT.
-    ///
-    /// <div class="warning">This method is meant for special usage and is normally not needed, use
-    /// it only if you know what you're doing</div>
-    pub fn color_psbt(
+    fn color_psbt_with_prevouts(
         &self,
         psbt: &mut Psbt,
         coloring_info: ColoringInfo,
+        prev_outputs: HashSet<OutPoint>,
     ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
         info!(self.logger, "Coloring PSBT...");
         let mut transaction = match psbt.clone().extract_tx() {
@@ -114,13 +111,6 @@ impl Wallet {
         }
 
         let runtime = self.rgb_runtime()?;
-
-        let prev_outputs = psbt
-            .unsigned_tx
-            .input
-            .iter()
-            .map(|txin| txin.previous_output)
-            .collect::<HashSet<OutPoint>>();
 
         let mut all_transitions: HashMap<ContractId, Transition> = HashMap::new();
         let mut asset_beneficiaries: AssetBeneficiariesMap = bmap![];
@@ -241,6 +231,24 @@ impl Wallet {
         Ok((fascia, asset_beneficiaries))
     }
 
+    /// Color a PSBT.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn color_psbt(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+    ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
+        let prev_outputs = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|txin| txin.previous_output)
+            .collect::<HashSet<OutPoint>>();
+        self.color_psbt_with_prevouts(psbt, coloring_info, prev_outputs)
+    }
+
     /// Color a PSBT, consume the RGB fascia and return the related consignment.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
@@ -252,6 +260,80 @@ impl Wallet {
     ) -> Result<Vec<RgbTransfer>, Error> {
         info!(self.logger, "Coloring PSBT and consuming...");
         let (fascia, asset_beneficiaries) = self.color_psbt(psbt, coloring_info.clone())?;
+
+        let witness_txid = psbt.get_txid();
+
+        let mut runtime = self.rgb_runtime()?;
+        runtime.consume_fascia(fascia, witness_txid, None)?;
+
+        let mut transfers = vec![];
+        for (contract_id, beneficiaries) in asset_beneficiaries {
+            let mut beneficiaries_witness = vec![];
+            let mut beneficiaries_blinded = vec![];
+            for builder_seal in beneficiaries {
+                match builder_seal {
+                    BuilderSeal::Revealed(seal) => {
+                        let explicit_seal = ExplicitSeal::with(witness_txid, seal.vout);
+                        beneficiaries_witness.push(explicit_seal);
+                    }
+                    BuilderSeal::Concealed(secret_seal) => {
+                        beneficiaries_blinded.push(secret_seal);
+                    }
+                };
+            }
+            transfers.push(runtime.transfer(
+                contract_id,
+                beneficiaries_witness,
+                beneficiaries_blinded,
+                Some(witness_txid),
+            )?);
+        }
+
+        info!(self.logger, "Color PSBT and consume completed");
+        Ok(transfers)
+    }
+
+    /// Color a PSBT using a provided set of input outpoints.
+    ///
+    /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
+    pub fn color_psbt_for_outpoints(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        input_outpoints: Vec<OutPoint>,
+    ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
+        let override_set: HashSet<OutPoint> = input_outpoints.into_iter().collect();
+        if override_set.is_empty() {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("input_outpoints is empty"),
+            });
+        }
+        let psbt_inputs: HashSet<OutPoint> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|txin| txin.previous_output)
+            .collect();
+        if !override_set.is_subset(&psbt_inputs) {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("input_outpoints must be a subset of PSBT inputs"),
+            });
+        }
+        self.color_psbt_with_prevouts(psbt, coloring_info, override_set)
+    }
+
+    /// Color a PSBT with a provided set of input outpoints and consume the resulting fascia.
+    ///
+    /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
+    pub fn color_psbt_for_outpoints_and_consume(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        input_outpoints: Vec<OutPoint>,
+    ) -> Result<Vec<RgbTransfer>, Error> {
+        info!(self.logger, "Coloring PSBT and consuming...");
+        let (fascia, asset_beneficiaries) =
+            self.color_psbt_for_outpoints(psbt, coloring_info.clone(), input_outpoints)?;
 
         let witness_txid = psbt.get_txid();
 
@@ -397,10 +479,7 @@ impl Wallet {
             .map(|o| {
                 let txid =
                     crate::bitcoin::Txid::from_str(&o.txid).map_err(|_| Error::InvalidTxid)?;
-                Ok(OutPoint {
-                    txid,
-                    vout: o.vout,
-                })
+                Ok(OutPoint { txid, vout: o.vout })
             })
             .collect::<Result<_, Error>>()?;
 
